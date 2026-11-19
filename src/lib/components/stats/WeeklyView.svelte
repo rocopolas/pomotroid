@@ -1,9 +1,15 @@
 <script lang="ts">
-  import type { DayStat, StreakInfo } from '$lib/types';
+  import type { DayStat, StreakInfo, TagStat } from '$lib/types';
+  import TagBreakdown from './TagBreakdown.svelte';
   import * as m from '$paraglide/messages.js';
   import { getLocale } from '$paraglide/runtime.js';
 
-  let { week, streak }: { week: DayStat[] | null; streak: StreakInfo | null } = $props();
+  let {
+    week,
+    streak,
+    weekByTag = [],
+  }: { week: DayStat[] | null; streak: StreakInfo | null; weekByTag?: TagStat[] } = $props();
+  let showTagBreakdown = $derived(weekByTag.some((item) => item.tag !== null));
 
   const CHART_H = 140; // px, max bar height
   const BAR_W = 52; // px per bar
@@ -124,6 +130,10 @@
       </div>
     {/if}
   </div>
+
+  {#if showTagBreakdown}
+    <TagBreakdown items={weekByTag} />
+  {/if}
 </div>
 
 <style>

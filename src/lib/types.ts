@@ -14,6 +14,7 @@ export interface TimerState {
   work_round_number: number; // current work round (1-based)
   work_rounds_total: number; // total work rounds before long break
   session_work_count: number; // monotonic focus round count since last reset
+  active_tag: string | null;
 }
 
 /** Mirrors Rust `Settings` struct returned by `settings_get`. */
@@ -27,6 +28,7 @@ export interface Settings {
   auto_start_work: boolean;
   auto_start_break: boolean;
   tray_icon_enabled: boolean;
+  tray_show_timer: boolean;
   min_to_tray: boolean;
   min_to_tray_on_close: boolean;
   notifications_enabled: boolean;
@@ -56,6 +58,37 @@ export interface Settings {
   local_shortcut_volume_up: string;
   local_shortcut_mute: string;
   local_shortcut_fullscreen: string;
+  active_profile_id: number | null;
+  active_tag: string | null;
+}
+
+export interface TimerProfile {
+  id: number;
+  name: string;
+  time_work_secs: number;
+  time_short_break_secs: number;
+  time_long_break_secs: number;
+  long_break_interval: number;
+  short_breaks_enabled: boolean;
+  long_breaks_enabled: boolean;
+  is_builtin: boolean;
+  sort_order: number;
+}
+
+export interface ProfileInput {
+  name: string;
+  time_work_secs: number;
+  time_short_break_secs: number;
+  time_long_break_secs: number;
+  long_break_interval: number;
+  short_breaks_enabled: boolean;
+  long_breaks_enabled: boolean;
+}
+
+export interface Tag {
+  id: number;
+  name: string;
+  color: string | null;
 }
 
 /** Returned by `check_update` — describes an available update. */
@@ -83,11 +116,18 @@ export interface Theme {
 // Stats types — mirror Rust structs in commands.rs / queries.rs
 // ---------------------------------------------------------------------------
 
+export interface TagStat {
+  tag: string | null;
+  rounds: number;
+  focus_mins: number;
+}
+
 export interface DailyStats {
   rounds: number;
   focus_mins: number;
   completion_rate: number | null; // null when no sessions started today
   by_hour: number[]; // 24 entries, index = hour of day
+  by_tag: TagStat[];
 }
 
 export interface DayStat {
@@ -109,7 +149,10 @@ export interface StreakInfo {
 export interface DetailedStats {
   today: DailyStats;
   week: DayStat[];
+  week_by_tag: TagStat[];
   streak: StreakInfo;
+  available_tags: string[];
+  has_untagged: boolean;
 }
 
 /** Returned by stats_get_heatmap — heatmap entries + lifetime totals. */

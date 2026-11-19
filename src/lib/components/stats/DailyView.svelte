@@ -1,8 +1,12 @@
 <script lang="ts">
   import type { DailyStats } from '$lib/types';
+  import TagBreakdown from './TagBreakdown.svelte';
   import * as m from '$paraglide/messages.js';
 
   let { today }: { today: DailyStats | null } = $props();
+  let showTagBreakdown = $derived(
+    (today?.by_tag ?? []).some((item) => item.tag !== null)
+  );
 
   const CHART_H = 80; // px, max bar height in the hourly chart
   const CHART_W = 744; // px, total SVG width for 24 bars
@@ -94,6 +98,10 @@
       </svg>
     </div>
   </div>
+
+  {#if showTagBreakdown && today}
+    <TagBreakdown items={today.by_tag} />
+  {/if}
 </div>
 
 <style>

@@ -1,14 +1,40 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { getCurrentWebviewWindow, WebviewWindow } from '@tauri-apps/api/webviewWindow';
+  import { currentMonitor } from '@tauri-apps/api/window';
   import { setWindowVisibility } from '$lib/ipc';
   import { settings } from '$lib/stores/settings';
   import { isMac } from '$lib/utils/platform';
   import Tooltip from './Tooltip.svelte';
+  import ProfilePicker from './ProfilePicker.svelte';
   import * as m from '$paraglide/messages.js';
+
+  interface Props {
+    isCompact?: boolean;
+  }
+
+  let { isCompact = false }: Props = $props();
 
   let maximized = $state(false);
   let suppressTitlebarHover = $state(false);
+
+  async function centeredOnCurrentMonitor(width: number, height: number): Promise<{ x?: number; y?: number }> {
+    try {
+      const mon = await currentMonitor();
+      if (!mon) return {};
+      const scale = mon.scaleFactor || 1;
+      const mx = mon.position.x / scale;
+      const my = mon.position.y / scale;
+      const mw = mon.size.width / scale;
+      const mh = mon.size.height / scale;
+      return {
+        x: Math.round(mx + (mw - width) / 2),
+        y: Math.round(my + (mh - height) / 2),
+      };
+    } catch {
+      return {};
+    }
+  }
 
   function blurTitlebarControl() {
     const active = document.activeElement;
@@ -50,11 +76,13 @@
       await existing.setFocus();
       return;
     }
+    const pos = await centeredOnCurrentMonitor(720, 520);
     new WebviewWindow('settings', {
       url: '/settings',
       title: 'Pomotroid — Settings',
       width: 720,
       height: 520,
+      ...pos,
       // On macOS: native decorations + overlay titlebar for rounded corners and
       // traffic light buttons. On other platforms: custom decorations-free window.
       decorations: isMac,
@@ -73,11 +101,13 @@
       await existing.setFocus();
       return;
     }
+    const pos = await centeredOnCurrentMonitor(840, 560);
     new WebviewWindow('stats', {
       url: '/stats',
       title: 'Pomotroid — Statistics',
       width: 840,
-      height: 520,
+      height: 560,
+      ...pos,
       decorations: isMac,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       titleBarStyle: isMac ? ('Overlay' as any) : undefined,
@@ -186,6 +216,12 @@
     {@render statsBtn()}
   {/if}
 
+  {#if !isCompact}
+    <div class="profile-center">
+      <ProfilePicker onManage={openSettings} />
+    </div>
+  {/if}
+
   <!-- Right: settings + stats buttons on macOS, window controls on Linux/Windows. -->
   <div class="controls">
     {#if isMac}
@@ -292,6 +328,15 @@
     display: flex;
     gap: 4px;
     margin-left: auto;
+  }
+
+  .profile-center {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    z-index: 20;
   }
 
   .btn-icon {

@@ -90,6 +90,40 @@ const MIGRATION_6: &str = "
     INSERT INTO schema_version VALUES (6);
 ";
 
+/// Adds timer profiles, session tags, and macOS menu bar timer setting.
+const MIGRATION_7_BASE: &str = "
+    CREATE TABLE IF NOT EXISTS profiles (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        name                  TEXT NOT NULL UNIQUE,
+        time_work_secs        INTEGER NOT NULL CHECK(time_work_secs >= 60),
+        time_short_break_secs INTEGER NOT NULL CHECK(time_short_break_secs >= 60),
+        time_long_break_secs  INTEGER NOT NULL CHECK(time_long_break_secs >= 60),
+        long_break_interval   INTEGER NOT NULL DEFAULT 4 CHECK(long_break_interval >= 1),
+        short_breaks_enabled  INTEGER NOT NULL DEFAULT 1 CHECK(short_breaks_enabled IN (0, 1)),
+        long_breaks_enabled   INTEGER NOT NULL DEFAULT 1 CHECK(long_breaks_enabled IN (0, 1)),
+        is_builtin            INTEGER NOT NULL DEFAULT 0 CHECK(is_builtin IN (0, 1)),
+        sort_order            INTEGER NOT NULL DEFAULT 0
+    );
+
+    INSERT OR IGNORE INTO profiles
+        (name, time_work_secs, time_short_break_secs, time_long_break_secs, long_break_interval, short_breaks_enabled, long_breaks_enabled, is_builtin, sort_order)
+    VALUES
+        ('Classic', 1500, 300, 900, 4, 1, 1, 1, 0),
+        ('Deep Focus', 3000, 600, 1200, 4, 1, 1, 1, 1),
+        ('Sprint', 900, 180, 600, 4, 1, 1, 1, 2);
+
+    CREATE TABLE IF NOT EXISTS tags (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        name       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        color      TEXT,
+        created_at INTEGER NOT NULL
+    );
+
+    INSERT OR IGNORE INTO settings (key, value) VALUES ('tray_show_timer', 'true');
+    INSERT OR IGNORE INTO settings (key, value) VALUES ('active_profile_id', '');
+    INSERT OR IGNORE INTO settings (key, value) VALUES ('active_tag', '');
+";
+
 /// Apply any pending migrations. Each migration is wrapped in a transaction
 /// so a partial failure leaves the database unchanged.
 pub fn run(conn: &Connection) -> Result<()> {
@@ -131,6 +165,36 @@ pub fn run(conn: &Connection) -> Result<()> {
         log::info!("[db/migrations] MIGRATION_6 complete");
     }
 
+    if version < 7 {
+        log::info!("[db/migrations] applying MIGRATION_7: profiles, tags, and menu bar timer setting");
+        let sessions_exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='sessions'",
+            [],
+            |row| row.get(0),
+        )?;
+        let tag_col_exists: bool = if sessions_exists {
+            conn.query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('sessions') WHERE name='tag'",
+                [],
+                |row| row.get(0),
+            )?
+        } else {
+            false
+        };
+
+        let alter_sessions = if sessions_exists && !tag_col_exists {
+            "ALTER TABLE sessions ADD COLUMN tag TEXT;
+             CREATE INDEX IF NOT EXISTS idx_sessions_tag ON sessions(tag);"
+        } else {
+            ""
+        };
+
+        conn.execute_batch(&format!(
+            "BEGIN; {MIGRATION_7_BASE} {alter_sessions} INSERT INTO schema_version VALUES (7); COMMIT;"
+        ))?;
+        log::info!("[db/migrations] MIGRATION_7 complete");
+    }
+
     Ok(())
 }
 
@@ -166,14 +230,21 @@ mod tests {
         let v: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 6);
+        assert_eq!(v, 7);
     }
 
     #[test]
     fn all_tables_created() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
-        for table in &["settings", "sessions", "custom_themes", "schema_version"] {
+        for table in &[
+            "settings",
+            "sessions",
+            "custom_themes",
+            "profiles",
+            "tags",
+            "schema_version",
+        ] {
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -183,5 +254,25 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "table '{table}' was not created");
         }
+    }
+
+    #[test]
+    fn migration_7_seeds_builtin_profiles_and_adds_session_tag_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        let profile_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM profiles WHERE is_builtin = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(profile_count, 3);
+
+        let tag_col: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='tag'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tag_col, 1);
     }
 }

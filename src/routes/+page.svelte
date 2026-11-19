@@ -180,7 +180,7 @@
 {/if}
 
 <div class="app">
-  <Titlebar />
+  <Titlebar {isCompact} />
   <main class:compact={isCompact}>
     <Timer {isCompact} {uiScale} />
   </main>

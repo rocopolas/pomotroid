@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 // Public types
 // ---------------------------------------------------------------------------
 
+pub const MIN_ROUND_SECS: u32 = 60;
+pub const MAX_ADJUSTED_ROUND_SECS: u32 = 7200;
+
 #[derive(Debug, Clone)]
 pub enum TimerCommand {
     Start,
@@ -26,6 +29,13 @@ pub enum TimerCommand {
     /// Update the stored duration without altering phase or elapsed time.
     /// Used to arm the next round/reset path without clobbering a fresh Start.
     Prime { duration_secs: u32 },
+    /// Adjust the active round's total duration by a signed delta (e.g. +300 / -300s)
+    /// without altering the running/paused/idle phase.
+    AdjustDuration { delta_secs: i32 },
+    /// Live-update the active round's total duration from settings/profile changes
+    /// without resetting elapsed time or stopping the timer. Ignored if active and
+    /// `duration_secs <= elapsed_secs` so an in-progress round never completes abruptly.
+    SetTotal { duration_secs: u32 },
     /// OS sleep detected: freeze elapsed position, block until WakeResume.
     Suspend,
     /// OS wake detected: resume from the saved elapsed position.
@@ -37,11 +47,31 @@ pub enum TimerCommand {
 pub enum TimerEvent {
     Started { total_secs: u32 },
     Tick { elapsed_secs: u32, total_secs: u32 },
+    DurationAdjusted { elapsed_secs: u32, total_secs: u32 },
     Complete { skipped: bool },
     Paused { elapsed_secs: u32 },
     Resumed { elapsed_secs: u32 },
     Reset,
     Suspended { elapsed_secs: u32 },
+}
+
+/// Safely apply a signed delta to `current_total`, preserving at least
+/// `MIN_ROUND_SECS` remaining (or leaving remaining untouched if already below
+/// that floor when subtracting) and capping at `MAX_ADJUSTED_ROUND_SECS`.
+pub fn clamp_adjusted_total(current_total: u32, elapsed: u32, delta_secs: i32) -> u32 {
+    if delta_secs < 0 {
+        let remaining = current_total.saturating_sub(elapsed);
+        if remaining <= MIN_ROUND_SECS {
+            return current_total;
+        }
+        let floor = elapsed.saturating_add(MIN_ROUND_SECS) as i64;
+        (current_total as i64 + delta_secs as i64).max(floor) as u32
+    } else {
+        let cap = MAX_ADJUSTED_ROUND_SECS as i64;
+        (current_total as i64 + delta_secs as i64)
+            .min(cap)
+            .max(current_total as i64) as u32
+    }
 }
 
 /// Cheap-to-clone handle for sending commands to the engine thread.
@@ -130,6 +160,22 @@ fn run_loop(
                     total_secs = d;
                     Transition::Stay
                 }
+                Ok(TimerCommand::AdjustDuration { delta_secs }) => {
+                    total_secs = clamp_adjusted_total(total_secs, 0, delta_secs);
+                    let _ = event_tx.send(TimerEvent::DurationAdjusted {
+                        elapsed_secs: 0,
+                        total_secs,
+                    });
+                    Transition::Stay
+                }
+                Ok(TimerCommand::SetTotal { duration_secs: d }) => {
+                    total_secs = d.max(MIN_ROUND_SECS);
+                    let _ = event_tx.send(TimerEvent::DurationAdjusted {
+                        elapsed_secs: 0,
+                        total_secs,
+                    });
+                    Transition::Stay
+                }
                 // Reset while Idle: emit the event so the listener can update
                 // the frontend and then sync the next-round duration. Without
                 // this handler the command would be silently swallowed,
@@ -177,6 +223,24 @@ fn run_loop(
                     // Clamp so a stale Prime never causes immediate completion
                     // on the next Resume tick.
                     total_secs = d.max(elapsed_secs.saturating_add(1));
+                    Transition::Stay
+                }
+                Ok(TimerCommand::AdjustDuration { delta_secs }) => {
+                    total_secs = clamp_adjusted_total(total_secs, elapsed_secs, delta_secs);
+                    let _ = event_tx.send(TimerEvent::DurationAdjusted {
+                        elapsed_secs,
+                        total_secs,
+                    });
+                    Transition::Stay
+                }
+                Ok(TimerCommand::SetTotal { duration_secs: d }) => {
+                    if d > elapsed_secs {
+                        total_secs = d;
+                        let _ = event_tx.send(TimerEvent::DurationAdjusted {
+                            elapsed_secs,
+                            total_secs,
+                        });
+                    }
                     Transition::Stay
                 }
                 Ok(TimerCommand::Shutdown) | Err(_) => Transition::Break,
@@ -236,6 +300,24 @@ fn run_loop(
                         // running never causes an immediate spurious completion
                         // on the next tick.
                         total_secs = d.max(elapsed_secs.saturating_add(1));
+                        Transition::Stay
+                    }
+                    Ok(TimerCommand::AdjustDuration { delta_secs }) => {
+                        total_secs = clamp_adjusted_total(total_secs, elapsed_secs, delta_secs);
+                        let _ = event_tx.send(TimerEvent::DurationAdjusted {
+                            elapsed_secs,
+                            total_secs,
+                        });
+                        Transition::Stay
+                    }
+                    Ok(TimerCommand::SetTotal { duration_secs: d }) => {
+                        if d > elapsed_secs {
+                            total_secs = d;
+                            let _ = event_tx.send(TimerEvent::DurationAdjusted {
+                                elapsed_secs,
+                                total_secs,
+                            });
+                        }
                         Transition::Stay
                     }
                     Ok(TimerCommand::Shutdown) => Transition::Break,
@@ -613,5 +695,59 @@ mod tests {
             wall <= nominal + Duration::from_millis(200),
             "drift exceeded tolerance: {wall:?} for nominal {nominal:?}"
         );
+    }
+
+    #[test]
+    fn clamp_adjusted_total_handles_bounds_and_near_zero() {
+        assert_eq!(clamp_adjusted_total(1500, 0, 300), 1800);
+        assert_eq!(clamp_adjusted_total(1500, 0, -300), 1200);
+        assert_eq!(clamp_adjusted_total(240, 0, -300), 60);
+        assert_eq!(clamp_adjusted_total(60, 0, -300), 60);
+        // Remaining 30s: subtracting must be a no-op, not increase remaining time.
+        assert_eq!(clamp_adjusted_total(1500, 1470, -300), 1500);
+        // Remaining 30s: adding still works.
+        assert_eq!(clamp_adjusted_total(1500, 1470, 300), 1800);
+        // Remaining 5m: subtracting clamps to 1m remaining.
+        assert_eq!(clamp_adjusted_total(900, 600, -300), 660);
+        // Upper cap at 2h.
+        assert_eq!(clamp_adjusted_total(7000, 0, 300), MAX_ADJUSTED_ROUND_SECS);
+    }
+
+    #[test]
+    fn adjust_duration_and_set_total_work_in_idle_and_running() {
+        let (handle, rx) = spawn(1500, TICK);
+        handle.send(TimerCommand::AdjustDuration { delta_secs: 300 });
+        match rx.recv_timeout(Duration::from_millis(200)).unwrap() {
+            TimerEvent::DurationAdjusted { elapsed_secs, total_secs } => {
+                assert_eq!(elapsed_secs, 0);
+                assert_eq!(total_secs, 1800);
+            }
+            other => panic!("expected DurationAdjusted, got {other:?}"),
+        }
+
+        handle.send(TimerCommand::SetTotal { duration_secs: 600 });
+        match rx.recv_timeout(Duration::from_millis(200)).unwrap() {
+            TimerEvent::DurationAdjusted { elapsed_secs, total_secs } => {
+                assert_eq!(elapsed_secs, 0);
+                assert_eq!(total_secs, 600);
+            }
+            other => panic!("expected DurationAdjusted, got {other:?}"),
+        }
+
+        // Start running, let 2 ticks pass, then adjust +300 and verify running continues.
+        handle.send(TimerCommand::Start);
+        std::thread::sleep(TICK * 2 + TICK / 2);
+        handle.send(TimerCommand::AdjustDuration { delta_secs: 300 });
+        std::thread::sleep(TICK * 2);
+        let events = drain(&rx);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TimerEvent::DurationAdjusted { total_secs: 900, .. }
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TimerEvent::Tick { total_secs: 900, .. }
+        )));
+        handle.send(TimerCommand::Shutdown);
     }
 }

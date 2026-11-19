@@ -199,6 +199,14 @@
     />
 
     {#if $settings.tray_icon_enabled}
+      {#if isMac}
+        <SettingsToggle
+          label={m.system_toggle_tray_timer()}
+          description={m.system_toggle_tray_timer_desc()}
+          checked={$settings.tray_show_timer}
+          onclick={() => toggle('tray_show_timer', $settings.tray_show_timer)}
+        />
+      {/if}
       <!-- Minimize to Tray is Windows/Linux only: the macOS yellow traffic-light
            button routes to the Dock and cannot be intercepted by the app. -->
       {#if !isMac}

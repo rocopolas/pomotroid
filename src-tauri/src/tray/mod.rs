@@ -114,6 +114,7 @@ pub struct TrayState {
     pub icon: Mutex<Option<TrayIcon<tauri::Wry>>>,
     pub colors: Mutex<TrayColors>,
     pub countdown_mode: Mutex<bool>,
+    pub show_timer_title: Mutex<bool>,
     pub menu_items: Mutex<Option<TrayMenuItems>>,
 }
 
@@ -123,6 +124,7 @@ impl TrayState {
             icon: Mutex::new(None),
             colors: Mutex::new(TrayColors::default()),
             countdown_mode: Mutex::new(false),
+            show_timer_title: Mutex::new(true),
             menu_items: Mutex::new(None),
         })
     }
@@ -208,13 +210,24 @@ pub(crate) fn appindicator_available() -> bool {
 /// built on the very first call.
 pub fn create_tray(app: &AppHandle, state: &Arc<TrayState>) {
     // Re-show existing icon if present — avoids duplicate OS tray entries.
-    {
+    let reused = {
         let guard = state.icon.lock().unwrap();
         if let Some(existing) = guard.as_ref() {
             let _ = existing.set_visible(true);
-            log::info!("[tray] shown (reused existing icon)");
-            return;
+            true
+        } else {
+            false
         }
+    };
+    if reused {
+        if let Some(timer) = app.try_state::<TimerController>() {
+            let snap = timer.get_snapshot();
+            let remaining = snap.total_secs.saturating_sub(snap.elapsed_secs);
+            update_title(state, remaining, snap.is_paused);
+            update_menu_items(state, snap.is_running, snap.is_paused);
+        }
+        log::info!("[tray] shown (reused existing icon)");
+        return;
     }
 
     // On Linux, libappindicator-sys aborts the process if neither
@@ -242,6 +255,14 @@ pub fn create_tray(app: &AppHandle, state: &Arc<TrayState>) {
         Ok(i) => i,
         Err(e) => { log::warn!("[tray] menu item error: {e}"); return; }
     };
+    let add_5_item = match MenuItem::with_id(app, "add-5", "+5 min", true, None::<&str>) {
+        Ok(i) => i,
+        Err(e) => { log::warn!("[tray] menu item error: {e}"); return; }
+    };
+    let sub_5_item = match MenuItem::with_id(app, "sub-5", "-5 min", true, None::<&str>) {
+        Ok(i) => i,
+        Err(e) => { log::warn!("[tray] menu item error: {e}"); return; }
+    };
     let sep = match PredefinedMenuItem::separator(app) {
         Ok(i) => i,
         Err(e) => { log::warn!("[tray] menu item error: {e}"); return; }
@@ -254,7 +275,10 @@ pub fn create_tray(app: &AppHandle, state: &Arc<TrayState>) {
         Ok(i) => i,
         Err(e) => { log::warn!("[tray] menu item error: {e}"); return; }
     };
-    let menu = match Menu::with_items(app, &[&toggle_item, &skip_item, &reset_item, &sep, &show_item, &exit_item]) {
+    let menu = match Menu::with_items(
+        app,
+        &[&toggle_item, &skip_item, &reset_item, &add_5_item, &sub_5_item, &sep, &show_item, &exit_item],
+    ) {
         Ok(m) => m,
         Err(e) => { log::warn!("[tray] menu error: {e}"); return; }
     };
@@ -317,6 +341,16 @@ pub fn create_tray(app: &AppHandle, state: &Arc<TrayState>) {
                         timer.restart_round();
                     }
                 }
+                "add-5" => {
+                    if let Some(timer) = app.try_state::<TimerController>() {
+                        timer.adjust_duration(300);
+                    }
+                }
+                "sub-5" => {
+                    if let Some(timer) = app.try_state::<TimerController>() {
+                        timer.adjust_duration(-300);
+                    }
+                }
                 "show" => {
                     log::info!("[tray] show");
                     if let Some(window) = app.get_webview_window("main") {
@@ -342,6 +376,12 @@ pub fn create_tray(app: &AppHandle, state: &Arc<TrayState>) {
                 skip: skip_item,
                 reset_round: reset_item,
             });
+            if let Some(timer) = app.try_state::<TimerController>() {
+                let snap = timer.get_snapshot();
+                let remaining = snap.total_secs.saturating_sub(snap.elapsed_secs);
+                update_title(state, remaining, snap.is_paused);
+                update_menu_items(state, snap.is_running, snap.is_paused);
+            }
             log::info!("[tray] created");
         }
         Err(e) => log::warn!("[tray] failed to build tray icon: {e}"),
@@ -380,6 +420,37 @@ pub fn update_icon(state: &Arc<TrayState>, round_type: &str, paused: bool, progr
 
     let image = Image::new_owned(bytes, SIZE, SIZE);
     let _ = tray.set_icon(Some(image));
+}
+
+/// Format remaining seconds for the macOS menu bar title and tooltip.
+pub fn format_tray_title(remaining_secs: u32, is_paused: bool) -> String {
+    let mins = remaining_secs / 60;
+    let secs = remaining_secs % 60;
+    if is_paused {
+        format!("⏸ {:02}:{:02}", mins, secs)
+    } else {
+        format!("{:02}:{:02}", mins, secs)
+    }
+}
+
+/// Update the tray title (macOS menu bar text) and tooltip with remaining time.
+/// Called every tick as well as on state transitions and settings updates.
+pub fn update_title(state: &Arc<TrayState>, remaining_secs: u32, is_paused: bool) {
+    let guard = state.icon.lock().unwrap();
+    let Some(tray) = guard.as_ref() else { return };
+
+    let formatted = format_tray_title(remaining_secs, is_paused);
+    let _ = tray.set_tooltip(Some(&format!("Pomotroid — {formatted}")));
+
+    #[cfg(target_os = "macos")]
+    {
+        let show_title = *state.show_timer_title.lock().unwrap();
+        if show_title {
+            let _ = tray.set_title(Some(&formatted));
+        } else {
+            let _ = tray.set_title(None::<&str>);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -600,5 +671,13 @@ mod tests {
     #[test]
     fn tray_click_restores_hidden_window() {
         assert_eq!(tray_window_action(false, false), TrayWindowAction::Restore);
+    }
+
+    #[test]
+    fn format_tray_title_formats_running_and_paused() {
+        assert_eq!(format_tray_title(1500, false), "25:00");
+        assert_eq!(format_tray_title(249, false), "04:09");
+        assert_eq!(format_tray_title(249, true), "⏸ 04:09");
+        assert_eq!(format_tray_title(0, false), "00:00");
     }
 }

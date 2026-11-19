@@ -12,6 +12,9 @@ import type {
   DetailedStats,
   HeatmapStats,
   UpdateInfo,
+  TimerProfile,
+  ProfileInput,
+  Tag,
 } from '$lib/types';
 
 // --- Timer commands ---
@@ -21,6 +24,25 @@ export const timerReset = () => invoke<void>('timer_reset');
 export const timerRestartRound = () => invoke<void>('timer_restart_round');
 export const timerSkip = () => invoke<void>('timer_skip');
 export const getTimerState = () => invoke<TimerState>('timer_get_state');
+export const timerAdjustDuration = (deltaSecs: number) =>
+  invoke<void>('timer_adjust_duration', { deltaSecs });
+export const timerSetTag = (tag: string | null) =>
+  invoke<TimerState>('timer_set_tag', { tag });
+
+// --- Profiles & Tags commands ---
+
+export const profilesList = () => invoke<TimerProfile[]>('profiles_list');
+export const profilesCreate = (input: ProfileInput) =>
+  invoke<TimerProfile>('profiles_create', { input });
+export const profilesUpdate = (id: number, input: ProfileInput) =>
+  invoke<TimerProfile>('profiles_update', { id, input });
+export const profilesDelete = (id: number) => invoke<void>('profiles_delete', { id });
+export const profilesApply = (id: number) => invoke<Settings>('profiles_apply', { id });
+
+export const tagsList = () => invoke<Tag[]>('tags_list');
+export const tagsCreate = (name: string, color: string | null = null) =>
+  invoke<Tag>('tags_create', { name, color });
+export const tagsDelete = (id: number) => invoke<void>('tags_delete', { id });
 
 // --- Settings commands ---
 
@@ -81,10 +103,12 @@ export const clearSessionHistory = () => invoke<void>('sessions_clear');
 // --- Stats commands ---
 
 /** Daily + weekly data + streak in one call (Today and This Week tabs). */
-export const statsGetDetailed = () => invoke<DetailedStats>('stats_get_detailed');
+export const statsGetDetailed = (tag: string | null = null) =>
+  invoke<DetailedStats>('stats_get_detailed', { tag });
 
 /** Heatmap entries + lifetime totals (All Time tab). */
-export const statsGetHeatmap = () => invoke<HeatmapStats>('stats_get_heatmap');
+export const statsGetHeatmap = (tag: string | null = null) =>
+  invoke<HeatmapStats>('stats_get_heatmap', { tag });
 
 // --- Platform commands ---
 
@@ -124,8 +148,17 @@ export const onRoundChange = (cb: (state: TimerState) => void): Promise<Unlisten
 export const onTimerReset = (cb: (state: TimerState) => void): Promise<UnlistenFn> =>
   listen<TimerState>('timer:reset', (e) => cb(e.payload));
 
+export const onTimerAdjusted = (cb: (state: TimerState) => void): Promise<UnlistenFn> =>
+  listen<TimerState>('timer:adjusted', (e) => cb(e.payload));
+
 export const onSettingsChanged = (cb: (settings: Settings) => void): Promise<UnlistenFn> =>
   listen<Settings>('settings:changed', (e) => cb(e.payload));
+
+export const onProfilesChanged = (cb: (profiles: TimerProfile[]) => void): Promise<UnlistenFn> =>
+  listen<TimerProfile[]>('profiles:changed', (e) => cb(e.payload));
+
+export const onTagsChanged = (cb: (tags: Tag[]) => void): Promise<UnlistenFn> =>
+  listen<Tag[]>('tags:changed', (e) => cb(e.payload));
 
 export const onThemesChanged = (cb: (themes: Theme[]) => void): Promise<UnlistenFn> =>
   listen<Theme[]>('themes:changed', (e) => cb(e.payload));

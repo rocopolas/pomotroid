@@ -8,6 +8,7 @@
     onThemesChanged,
     onRoundChange,
     onSessionsCleared,
+    onTagsChanged,
     statsGetDetailed,
     statsGetHeatmap,
   } from '$lib/ipc';
@@ -29,15 +30,34 @@
   type Tab = 'today' | 'week' | 'alltime';
 
   let activeTab = $state<Tab>('today');
+  let selectedTag = $state<string | null>(null);
   let detailed = $state<DetailedStats | null>(null);
   let heatmap = $state<HeatmapStats | null>(null);
   let heatmapLoaded = $state(false);
+
+  async function refreshStats(tag: string | null = selectedTag) {
+    detailed = await statsGetDetailed(tag);
+    if (activeTab === 'alltime' || heatmapLoaded) {
+      heatmap = await statsGetHeatmap(tag);
+      heatmapLoaded = true;
+    }
+  }
+
+  async function selectTag(tag: string | null) {
+    selectedTag = tag;
+    heatmapLoaded = false;
+    try {
+      await refreshStats(tag);
+    } catch (e) {
+      await logError(`[stats] failed to filter stats by tag: ${e}`);
+    }
+  }
 
   async function switchTab(tab: Tab) {
     activeTab = tab;
     if (tab === 'alltime' && !heatmapLoaded) {
       try {
-        heatmap = await statsGetHeatmap();
+        heatmap = await statsGetHeatmap(selectedTag);
         heatmapLoaded = true;
       } catch (e) {
         await logError(`[stats] failed to load heatmap: ${e}`);
@@ -67,7 +87,7 @@
         // Show window immediately after theme is applied
         await getCurrentWebviewWindow().show();
 
-        detailed = await statsGetDetailed();
+        detailed = await statsGetDetailed(selectedTag);
         await info(`[stats] initialized, theme=${activeTheme?.name ?? 'none'}`);
       } catch (e) {
         await logError(`[stats] initialization failed: ${e}`);
@@ -77,18 +97,24 @@
       cleanups.push(
         await onRoundChange(async () => {
           try {
-            detailed = await statsGetDetailed();
-            if (heatmapLoaded) heatmap = await statsGetHeatmap();
+            await refreshStats(selectedTag);
           } catch (e) {
             await logError(`[stats] failed to refresh stats after round change: ${e}`);
           }
         }),
         await onSessionsCleared(async () => {
           try {
-            detailed = await statsGetDetailed();
-            if (heatmapLoaded) heatmap = await statsGetHeatmap();
+            selectedTag = null;
+            await refreshStats(null);
           } catch (e) {
             await logError(`[stats] failed to refresh stats after session clear: ${e}`);
+          }
+        }),
+        await onTagsChanged(async () => {
+          try {
+            await refreshStats(selectedTag);
+          } catch (e) {
+            await logError(`[stats] failed to refresh stats after tags change: ${e}`);
           }
         }),
         await onSettingsChanged(async (updated) => {
@@ -171,12 +197,47 @@
     >
   </div>
 
+  <!-- Tag filter bar -->
+  {#if detailed && detailed.available_tags.length > 0}
+    <div class="tag-filter-bar">
+      <button
+        class="filter-chip"
+        class:active={selectedTag === null}
+        onclick={() => selectTag(null)}
+      >
+        {m.tag_all()}
+      </button>
+      {#each detailed.available_tags as tag}
+        <button
+          class="filter-chip"
+          class:active={selectedTag === tag}
+          onclick={() => selectTag(tag)}
+        >
+          #{tag}
+        </button>
+      {/each}
+      {#if detailed.has_untagged}
+        <button
+          class="filter-chip"
+          class:active={selectedTag === '__untagged__'}
+          onclick={() => selectTag('__untagged__')}
+        >
+          {m.tag_untagged()}
+        </button>
+      {/if}
+    </div>
+  {/if}
+
   <!-- Content -->
   <div class="content">
     {#if activeTab === 'today'}
       <DailyView today={detailed?.today ?? null} />
     {:else if activeTab === 'week'}
-      <WeeklyView week={detailed?.week ?? null} streak={detailed?.streak ?? null} />
+      <WeeklyView
+        week={detailed?.week ?? null}
+        streak={detailed?.streak ?? null}
+        weekByTag={detailed?.week_by_tag ?? []}
+      />
     {:else}
       <YearlyView {heatmap} />
     {/if}
@@ -277,10 +338,48 @@
     border-bottom-color: var(--color-focus-round);
   }
 
+  /* ── Tag filter bar ────────────────────────────────────── */
+  .tag-filter-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 24px;
+    border-bottom: 1px solid var(--color-separator);
+    overflow-x: auto;
+    flex-shrink: 0;
+  }
+
+  .filter-chip {
+    padding: 3px 10px;
+    border-radius: 999px;
+    border: 1px solid color-mix(in oklch, var(--color-foreground) 14%, transparent);
+    background: none;
+    color: var(--color-foreground-darker);
+    font-size: 0.72rem;
+    white-space: nowrap;
+    cursor: pointer;
+    transition:
+      color 0.15s,
+      background 0.15s,
+      border-color 0.15s;
+  }
+
+  .filter-chip:hover {
+    color: var(--color-foreground);
+    background: var(--color-hover);
+  }
+
+  .filter-chip.active {
+    color: var(--color-foreground);
+    border-color: var(--color-focus-round);
+    background: color-mix(in oklch, var(--color-focus-round) 16%, transparent);
+  }
+
   /* ── Content ───────────────────────────────────────────── */
   .content {
     flex: 1;
-    overflow: hidden;
+    overflow-y: auto;
+    overflow-x: hidden;
     display: flex;
     flex-direction: column;
   }

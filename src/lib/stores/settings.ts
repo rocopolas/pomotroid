@@ -14,6 +14,7 @@ const defaults: Settings = {
   auto_start_work: false,
   auto_start_break: false,
   tray_icon_enabled: false,
+  tray_show_timer: true,
   min_to_tray: false,
   min_to_tray_on_close: false,
   notifications_enabled: false,
@@ -43,6 +44,8 @@ const defaults: Settings = {
   local_shortcut_volume_up: 'ArrowUp',
   local_shortcut_mute: 'm',
   local_shortcut_fullscreen: 'F11',
+  active_profile_id: null,
+  active_tag: null,
 };
 
 export const settings = writable<Settings>(defaults);

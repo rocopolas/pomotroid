@@ -6,12 +6,14 @@
     timerToggle,
     timerRestartRound,
     timerSkip,
+    timerAdjustDuration,
     getTimerState,
     onTimerTick,
     onTimerPaused,
     onTimerResumed,
     onRoundChange,
     onTimerReset,
+    onTimerAdjusted,
   } from '$lib/ipc';
   import { timerState } from '$lib/stores/timer';
   import { settings } from '$lib/stores/settings';
@@ -20,6 +22,7 @@
   import TimerDisplay from './TimerDisplay.svelte';
   import TimerFooter from './TimerFooter.svelte';
   import MiniControls from './MiniControls.svelte';
+  import TagPicker from './TagPicker.svelte';
   import Tooltip from './Tooltip.svelte';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import * as m from '$paraglide/messages.js';
@@ -33,6 +36,9 @@
   let { isCompact = false, uiScale = 1 }: Props = $props();
 
   let state = $derived($timerState);
+  let remainingSecs = $derived(Math.max(0, state.total_secs - state.elapsed_secs));
+  let canSubtractFive = $derived(remainingSecs > 60);
+  let canAddFive = $derived(state.total_secs < 7200);
 
   function roundColor(rt: string): string {
     if (rt === 'work') return 'var(--color-focus-round)';
@@ -103,6 +109,9 @@
         }),
         await onTimerReset((snap) => {
           timerState.set(snap);
+        }),
+        await onTimerAdjusted((snap) => {
+          timerState.set(snap);
         })
       );
     })();
@@ -122,11 +131,41 @@
     </div>
 
     {#if !isCompact}
-      <!-- Round type label sits below the dial as a normal flex child so it
-           does not affect the dial-stack height used to centre TimerDisplay. -->
-      <div class="round-label" style="color: {roundColor(state.round_type)}">
-        {roundLabel(state.round_type)}
+      <!-- Round label flanked by quick -5m / +5m adjust pills -->
+      <div class="round-row">
+        <div class="adjust-slot adjust-slot--left">
+          <Tooltip text={m.tooltip_sub_5()}>
+            <button
+              class="btn-adjust"
+              onclick={() => timerAdjustDuration(-300)}
+              disabled={!canSubtractFive}
+              aria-label={m.tooltip_sub_5()}
+            >
+              -5m
+            </button>
+          </Tooltip>
+        </div>
+
+        <div class="round-label" style="color: {roundColor(state.round_type)}">
+          {roundLabel(state.round_type)}
+        </div>
+
+        <div class="adjust-slot adjust-slot--right">
+          <Tooltip text={m.tooltip_add_5()}>
+            <button
+              class="btn-adjust"
+              onclick={() => timerAdjustDuration(300)}
+              disabled={!canAddFive}
+              aria-label={m.tooltip_add_5()}
+            >
+              +5m
+            </button>
+          </Tooltip>
+        </div>
       </div>
+
+      <!-- Session tag picker -->
+      <TagPicker activeTag={state.active_tag} />
 
       <div class="controls-wrapper">
         <!-- Back: restart current round -->
@@ -193,7 +232,7 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 16px;
+    gap: 12px;
   }
 
   .dial-stack {
@@ -268,12 +307,62 @@
     justify-content: center;
   }
 
+  .round-row {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    width: 248px;
+    margin-top: -6px;
+  }
+
+  .adjust-slot {
+    display: flex;
+    align-items: center;
+  }
+
+  .adjust-slot--left {
+    justify-content: flex-end;
+    padding-right: 12px;
+  }
+
+  .adjust-slot--right {
+    justify-content: flex-start;
+    padding-left: 12px;
+  }
+
+  .btn-adjust {
+    background: color-mix(in oklch, var(--color-foreground) 5%, transparent);
+    border: 1px solid color-mix(in oklch, var(--color-foreground) 10%, transparent);
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-size: 0.68rem;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    color: var(--color-foreground-darker, var(--color-foreground));
+    cursor: pointer;
+    transition:
+      color var(--transition-default),
+      background var(--transition-default),
+      border-color var(--transition-default),
+      opacity var(--transition-default);
+  }
+
+  .btn-adjust:hover:not(:disabled) {
+    color: var(--color-foreground);
+    background: var(--color-hover);
+    border-color: color-mix(in oklch, var(--color-foreground) 22%, transparent);
+  }
+
+  .btn-adjust:disabled {
+    opacity: 0.28;
+    cursor: default;
+  }
+
   .round-label {
     font-size: 0.75rem;
     font-weight: 600;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    /* Collapse the gap above: the flex gap already provides spacing from the dial. */
-    margin-top: -8px;
+    text-align: center;
   }
 </style>

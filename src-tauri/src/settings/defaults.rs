@@ -10,6 +10,7 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("auto_start_work", "true"),
     ("auto_start_break", "true"),
     ("tray_icon_enabled", "false"),
+    ("tray_show_timer", "true"),
     ("min_to_tray", "false"),
     ("min_to_tray_on_close", "false"),
     ("notifications", "false"),
@@ -39,4 +40,6 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("local_shortcut_volume_up", "ArrowUp"),
     ("local_shortcut_mute", "m"),
     ("local_shortcut_fullscreen", "F11"),
+    ("active_profile_id", ""),
+    ("active_tag", ""),
 ];

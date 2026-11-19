@@ -54,6 +54,51 @@ pub fn timer_get_state(timer: State<'_, TimerController>) -> TimerSnapshot {
     timer.get_snapshot()
 }
 
+/// Adjust the current round's duration by a signed delta in seconds (e.g. +300 / -300).
+/// Does not modify persisted settings or active profile.
+#[tauri::command]
+pub fn timer_adjust_duration(delta_secs: i32, timer: State<'_, TimerController>) {
+    timer.adjust_duration(delta_secs);
+}
+
+/// Set or clear the active session tag. Persists in settings, registers new tags
+/// in the `tags` table for quick reuse, and updates any in-progress focus session.
+#[tauri::command]
+pub fn timer_set_tag(
+    tag: Option<String>,
+    db: State<'_, DbState>,
+    timer: State<'_, TimerController>,
+    app: AppHandle,
+) -> Result<TimerSnapshot, String> {
+    let clean = tag
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+
+    let (new_settings, tags_updated) = {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let mut created = false;
+        if let Some(ref name) = clean {
+            queries::upsert_tag(&conn, name, None).map_err(|e| e.to_string())?;
+            created = true;
+        }
+        settings::save_setting(&conn, "active_tag", clean.as_deref().unwrap_or(""))
+            .map_err(|e| e.to_string())?;
+        let s = settings::load(&conn).map_err(|e| e.to_string())?;
+        (s, created)
+    };
+
+    let snap = timer.set_active_tag(clean);
+    app.emit("settings:changed", &new_settings).ok();
+    if tags_updated {
+        if let Ok(conn) = db.lock() {
+            if let Ok(all_tags) = queries::list_tags(&conn) {
+                app.emit("tags:changed", &all_tags).ok();
+            }
+        }
+    }
+    Ok(snap)
+}
+
 // ---------------------------------------------------------------------------
 // CMD-02 — Settings commands
 // ---------------------------------------------------------------------------
@@ -96,6 +141,19 @@ pub fn settings_set(
             settings::save_setting(&conn, "min_to_tray", "false").map_err(|e| e.to_string())?;
             settings::save_setting(&conn, "min_to_tray_on_close", "false").map_err(|e| e.to_string())?;
         }
+        // Editing any profile-controlled timer setting detaches from the active preset
+        // so the UI clearly reflects "Custom" until a profile is selected or saved.
+        if matches!(
+            key.as_str(),
+            "time_work_secs"
+                | "time_short_break_secs"
+                | "time_long_break_secs"
+                | "work_rounds"
+                | "short_breaks_enabled"
+                | "long_breaks_enabled"
+        ) {
+            settings::save_setting(&conn, "active_profile_id", "").map_err(|e| e.to_string())?;
+        }
         settings::load(&conn).map_err(|e| {
             log::error!("[settings] failed to reload after save: {e}");
             e.to_string()
@@ -114,14 +172,22 @@ pub fn settings_set(
     }
 
     // Keep the timer engine in sync when time-related settings change.
-    timer.apply_settings(new_settings.clone());
+    let _outcome = timer.apply_settings(new_settings.clone());
 
     // Broadcast an updated snapshot so the frontend immediately reflects any
-    // changed settings (round count, durations, etc.) regardless of timer
-    // state.  The timer:reset handler only calls timerState.set(), so emitting
-    // while running does not interrupt the countdown; the next timer:tick
-    // event will reconcile total_secs from the engine within one second.
-    app.emit("timer:reset", &timer.get_snapshot()).ok();
+    // changed settings (round count, live duration updates, etc.).
+    app.emit("timer:adjusted", &timer.get_snapshot()).ok();
+
+    // Sync macOS menu bar countdown visibility immediately.
+    if key == "tray_show_timer" {
+        *tray_state.show_timer_title.lock().unwrap() = new_settings.tray_show_timer;
+        let snap = timer.get_snapshot();
+        tray::update_title(
+            &tray_state,
+            snap.total_secs.saturating_sub(snap.elapsed_secs),
+            snap.is_paused,
+        );
+    }
 
     // Propagate volume and tick-sound changes to the audio engine (optional state).
     if let Some(audio) = app.try_state::<Arc<AudioManager>>() {
@@ -252,14 +318,14 @@ pub fn settings_reset_defaults(
 
     timer.apply_settings(new_settings.clone());
     *tray_state.countdown_mode.lock().unwrap() = new_settings.dial_countdown;
+    *tray_state.show_timer_title.lock().unwrap() = new_settings.tray_show_timer;
+    timer.set_active_tag(None);
 
     // Broadcast a reset snapshot so the frontend dial and display reflect the
     // restored default durations without requiring the user to manually reset.
     {
         let snap = timer.get_snapshot();
-        if !snap.is_running && !snap.is_paused {
-            app.emit("timer:reset", &snap).ok();
-        }
+        app.emit("timer:adjusted", &snap).ok();
     }
 
     // After reset, defaults have tray_icon_enabled=false and min_to_tray=false,
@@ -336,37 +402,61 @@ pub fn sessions_clear(db: State<'_, DbState>, app: AppHandle) -> Result<(), Stri
 // ---------------------------------------------------------------------------
 
 /// Batched stats for Today + This Week tabs (minimises IPC round-trips).
+/// Optional `tag` filters metrics: `None` = all, `Some("__untagged__")` = untagged, `Some(name)` = specific tag.
 #[tauri::command]
-pub fn stats_get_detailed(db: State<'_, DbState>) -> Result<DetailedStats, String> {
+pub fn stats_get_detailed(
+    tag: Option<String>,
+    db: State<'_, DbState>,
+) -> Result<DetailedStats, String> {
     let conn = db.lock().map_err(|e| e.to_string())?;
-    let today = queries::get_daily_stats(&conn).map_err(|e| {
+    let filter = queries::TagFilter::from_opt(tag.as_deref());
+    let today = queries::get_daily_stats(&conn, filter).map_err(|e| {
         log::error!("[stats] failed to query daily stats: {e}");
         e.to_string()
     })?;
-    let week = queries::get_weekly_stats(&conn).map_err(|e| {
+    let week = queries::get_weekly_stats(&conn, filter).map_err(|e| {
         log::error!("[stats] failed to query weekly stats: {e}");
         e.to_string()
     })?;
-    let streak = queries::get_streak(&conn).map_err(|e| {
+    let week_by_tag = queries::get_weekly_tag_breakdown(&conn).map_err(|e| {
+        log::error!("[stats] failed to query weekly tag breakdown: {e}");
+        e.to_string()
+    })?;
+    let streak = queries::get_streak(&conn, filter).map_err(|e| {
         log::error!("[stats] failed to query streak: {e}");
         e.to_string()
     })?;
-    Ok(DetailedStats { today, week, streak })
+    let (available_tags, has_untagged) = queries::list_used_session_tags(&conn).map_err(|e| {
+        log::error!("[stats] failed to query available tags: {e}");
+        e.to_string()
+    })?;
+    Ok(DetailedStats {
+        today,
+        week,
+        week_by_tag,
+        streak,
+        available_tags,
+        has_untagged,
+    })
 }
 
 /// Heatmap data + lifetime totals for the All Time tab.
 #[tauri::command]
-pub fn stats_get_heatmap(db: State<'_, DbState>) -> Result<HeatmapStats, String> {
+pub fn stats_get_heatmap(
+    tag: Option<String>,
+    db: State<'_, DbState>,
+) -> Result<HeatmapStats, String> {
     let conn = db.lock().map_err(|e| e.to_string())?;
-    let entries = queries::get_heatmap_data(&conn).map_err(|e| {
+    let filter = queries::TagFilter::from_opt(tag.as_deref());
+    let entries = queries::get_heatmap_data(&conn, filter).map_err(|e| {
         log::error!("[stats] failed to query heatmap data: {e}");
         e.to_string()
     })?;
-    let raw = queries::get_all_time_stats(&conn).map_err(|e| {
+    let raw = queries::get_all_time_stats(&conn, filter).map_err(|e| {
         log::error!("[stats] failed to query all-time stats: {e}");
         e.to_string()
     })?;
-    let streak = queries::get_streak(&conn).map_err(|e| {
+    let streak = queries::get_streak(&conn, filter).map_err(|e| {
         log::error!("[stats] failed to query streak for heatmap: {e}");
         e.to_string()
     })?;
@@ -376,6 +466,208 @@ pub fn stats_get_heatmap(db: State<'_, DbState>) -> Result<HeatmapStats, String>
         total_hours: (raw.total_work_secs / 3600) as u32,
         longest_streak: streak.longest,
     })
+}
+
+// ---------------------------------------------------------------------------
+// CMD-08 — Profiles & Tags commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn profiles_list(db: State<'_, DbState>) -> Result<Vec<queries::TimerProfile>, String> {
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    queries::list_profiles(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn profiles_create(
+    input: queries::ProfileInput,
+    db: State<'_, DbState>,
+    app: AppHandle,
+) -> Result<queries::TimerProfile, String> {
+    if input.name.trim().is_empty() {
+        return Err("Profile name cannot be empty".to_string());
+    }
+    let (profile, all) = {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let p = queries::create_profile(&conn, &input).map_err(|e| e.to_string())?;
+        let all = queries::list_profiles(&conn).map_err(|e| e.to_string())?;
+        (p, all)
+    };
+    app.emit("profiles:changed", &all).ok();
+    Ok(profile)
+}
+
+#[tauri::command]
+pub fn profiles_update(
+    id: i64,
+    input: queries::ProfileInput,
+    db: State<'_, DbState>,
+    timer: State<'_, TimerController>,
+    app: AppHandle,
+) -> Result<queries::TimerProfile, String> {
+    if input.name.trim().is_empty() {
+        return Err("Profile name cannot be empty".to_string());
+    }
+    let (profile, all, updated_settings) = {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let p = queries::update_profile(&conn, id, &input).map_err(|e| e.to_string())?;
+        let current = settings::load(&conn).map_err(|e| e.to_string())?;
+        let maybe_settings = if current.active_profile_id == Some(id) {
+            save_profile_settings(&conn, &p).map_err(|e| e.to_string())?;
+            Some(settings::load(&conn).map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+        let all = queries::list_profiles(&conn).map_err(|e| e.to_string())?;
+        (p, all, maybe_settings)
+    };
+    if let Some(new_settings) = updated_settings {
+        timer.apply_settings(new_settings.clone());
+        app.emit("timer:adjusted", &timer.get_snapshot()).ok();
+        app.emit("settings:changed", &new_settings).ok();
+    }
+    app.emit("profiles:changed", &all).ok();
+    Ok(profile)
+}
+
+#[tauri::command]
+pub fn profiles_delete(
+    id: i64,
+    db: State<'_, DbState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let (all, updated_settings) = {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let current = settings::load(&conn).map_err(|e| e.to_string())?;
+        queries::delete_profile(&conn, id).map_err(|e| e.to_string())?;
+        let maybe_settings = if current.active_profile_id == Some(id) {
+            settings::save_setting(&conn, "active_profile_id", "").map_err(|e| e.to_string())?;
+            Some(settings::load(&conn).map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+        let all = queries::list_profiles(&conn).map_err(|e| e.to_string())?;
+        (all, maybe_settings)
+    };
+    if let Some(new_settings) = updated_settings {
+        app.emit("settings:changed", &new_settings).ok();
+    }
+    app.emit("profiles:changed", &all).ok();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn profiles_apply(
+    id: i64,
+    db: State<'_, DbState>,
+    timer: State<'_, TimerController>,
+    app: AppHandle,
+) -> Result<Settings, String> {
+    let new_settings = {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let profile = queries::get_profile(&conn, id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("profile {id} not found"))?;
+        save_profile_settings(&conn, &profile).map_err(|e| e.to_string())?;
+        settings::load(&conn).map_err(|e| e.to_string())?
+    };
+
+    timer.apply_settings(new_settings.clone());
+    app.emit("timer:adjusted", &timer.get_snapshot()).ok();
+    app.emit("settings:changed", &new_settings).ok();
+    Ok(new_settings)
+}
+
+fn save_profile_settings(
+    conn: &rusqlite::Connection,
+    p: &queries::TimerProfile,
+) -> rusqlite::Result<()> {
+    settings::save_setting(conn, "time_work_secs", &p.time_work_secs.to_string())?;
+    settings::save_setting(
+        conn,
+        "time_short_break_secs",
+        &p.time_short_break_secs.to_string(),
+    )?;
+    settings::save_setting(
+        conn,
+        "time_long_break_secs",
+        &p.time_long_break_secs.to_string(),
+    )?;
+    settings::save_setting(conn, "work_rounds", &p.long_break_interval.to_string())?;
+    settings::save_setting(
+        conn,
+        "short_breaks_enabled",
+        if p.short_breaks_enabled { "true" } else { "false" },
+    )?;
+    settings::save_setting(
+        conn,
+        "long_breaks_enabled",
+        if p.long_breaks_enabled { "true" } else { "false" },
+    )?;
+    settings::save_setting(conn, "active_profile_id", &p.id.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn tags_list(db: State<'_, DbState>) -> Result<Vec<queries::Tag>, String> {
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    queries::list_tags(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn tags_create(
+    name: String,
+    color: Option<String>,
+    db: State<'_, DbState>,
+    app: AppHandle,
+) -> Result<queries::Tag, String> {
+    if name.trim().is_empty() {
+        return Err("Tag name cannot be empty".to_string());
+    }
+    let (tag, all) = {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let t = queries::upsert_tag(&conn, &name, color.as_deref()).map_err(|e| e.to_string())?;
+        let all = queries::list_tags(&conn).map_err(|e| e.to_string())?;
+        (t, all)
+    };
+    app.emit("tags:changed", &all).ok();
+    Ok(tag)
+}
+
+#[tauri::command]
+pub fn tags_delete(
+    id: i64,
+    db: State<'_, DbState>,
+    timer: State<'_, TimerController>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let (all, cleared_active) = {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let existing_name: Option<String> = conn
+            .query_row("SELECT name FROM tags WHERE id = ?1", [id], |r| r.get(0))
+            .ok();
+        queries::delete_tag(&conn, id).map_err(|e| e.to_string())?;
+        let current = settings::load(&conn).map_err(|e| e.to_string())?;
+        let should_clear = match (&existing_name, &current.active_tag) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            _ => false,
+        };
+        let updated_settings = if should_clear {
+            settings::save_setting(&conn, "active_tag", "").map_err(|e| e.to_string())?;
+            Some(settings::load(&conn).map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+        let all = queries::list_tags(&conn).map_err(|e| e.to_string())?;
+        (all, updated_settings)
+    };
+
+    if let Some(new_settings) = cleared_active {
+        timer.set_active_tag(None);
+        app.emit("settings:changed", &new_settings).ok();
+    }
+    app.emit("tags:changed", &all).ok();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -735,7 +1027,10 @@ fn cue_to_name_key(cue: &str) -> Result<&'static str, String> {
 pub struct DetailedStats {
     pub today: queries::DailyStats,
     pub week: Vec<queries::DayStat>,
+    pub week_by_tag: Vec<queries::TagStat>,
     pub streak: queries::StreakInfo,
+    pub available_tags: Vec<String>,
+    pub has_untagged: bool,
 }
 
 /// Payload for the All Time tab.

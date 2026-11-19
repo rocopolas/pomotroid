@@ -17,6 +17,8 @@ pub struct Settings {
     pub auto_start_work: bool,
     pub auto_start_break: bool,
     pub tray_icon_enabled: bool,
+    /// macOS: render remaining time (MM:SS) next to the menu bar tray icon.
+    pub tray_show_timer: bool,
     pub min_to_tray: bool,
     pub min_to_tray_on_close: bool,
     pub notifications_enabled: bool,
@@ -61,10 +63,22 @@ pub struct Settings {
     pub window_x: Option<i32>,
     /// Last known window Y coordinate (physical pixels). `None` = use OS default.
     pub window_y: Option<i32>,
-    /// Last known window width (physical pixels). `None` = use OS default.
+    /// Last known window width (physical pixels — legacy v1). `None` = use OS default.
     pub window_width: Option<u32>,
-    /// Last known window height (physical pixels). `None` = use OS default.
+    /// Last known window height (physical pixels — legacy v1). `None` = use OS default.
     pub window_height: Option<u32>,
+    /// Last known window logical X coordinate (DPI-independent).
+    pub window_logical_x: Option<i32>,
+    /// Last known window logical Y coordinate (DPI-independent).
+    pub window_logical_y: Option<i32>,
+    /// Last known window logical width (DPI-independent).
+    pub window_logical_width: Option<u32>,
+    /// Last known window logical height (DPI-independent).
+    pub window_logical_height: Option<u32>,
+    /// Active timer profile ID (`None` = Custom).
+    pub active_profile_id: Option<i64>,
+    /// Active session tag applied to recorded focus rounds (`None` = untagged).
+    pub active_tag: Option<String>,
 }
 
 impl Default for Settings {
@@ -75,6 +89,7 @@ impl Default for Settings {
             auto_start_work: true,
             auto_start_break: true,
             tray_icon_enabled: false,
+            tray_show_timer: true,
             min_to_tray: false,
             min_to_tray_on_close: false,
             notifications_enabled: false,
@@ -124,6 +139,12 @@ impl Default for Settings {
             window_y: None,
             window_width: None,
             window_height: None,
+            window_logical_x: None,
+            window_logical_y: None,
+            window_logical_width: None,
+            window_logical_height: None,
+            active_profile_id: None,
+            active_tag: None,
         }
     }
 }
@@ -184,6 +205,7 @@ pub fn load(conn: &Connection) -> Result<Settings> {
         auto_start_work: parse_bool(&map, "auto_start_work", d.auto_start_work),
         auto_start_break: parse_bool(&map, "auto_start_break", d.auto_start_break),
         tray_icon_enabled: parse_bool(&map, "tray_icon_enabled", d.tray_icon_enabled),
+        tray_show_timer: parse_bool(&map, "tray_show_timer", d.tray_show_timer),
         min_to_tray: parse_bool(&map, "min_to_tray", d.min_to_tray),
         min_to_tray_on_close: parse_bool(&map, "min_to_tray_on_close", d.min_to_tray_on_close),
         notifications_enabled: parse_bool(&map, "notifications", d.notifications_enabled),
@@ -249,6 +271,12 @@ pub fn load(conn: &Connection) -> Result<Settings> {
         window_y: parse_opt_i32(&map, "window_y"),
         window_width: parse_opt_u32(&map, "window_width"),
         window_height: parse_opt_u32(&map, "window_height"),
+        window_logical_x: parse_opt_i32(&map, "window_logical_x"),
+        window_logical_y: parse_opt_i32(&map, "window_logical_y"),
+        window_logical_width: parse_opt_u32(&map, "window_logical_width"),
+        window_logical_height: parse_opt_u32(&map, "window_logical_height"),
+        active_profile_id: parse_opt_i64(&map, "active_profile_id"),
+        active_tag: parse_opt_nonempty(&map, "active_tag"),
     })
 }
 
@@ -292,6 +320,23 @@ fn parse_opt_i32(map: &HashMap<String, String>, key: &str) -> Option<i32> {
 
 fn parse_opt_u32(map: &HashMap<String, String>, key: &str) -> Option<u32> {
     map.get(key)?.parse().ok()
+}
+
+fn parse_opt_i64(map: &HashMap<String, String>, key: &str) -> Option<i64> {
+    let raw = map.get(key)?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    raw.parse().ok()
+}
+
+fn parse_opt_nonempty(map: &HashMap<String, String>, key: &str) -> Option<String> {
+    let raw = map.get(key)?.trim();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------

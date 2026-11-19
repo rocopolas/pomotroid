@@ -24,12 +24,15 @@ use commands::{
     audio_clear_custom, audio_get_custom_info, audio_set_custom,
     get_log_dir, open_log_dir,
     notification_show,
+    profiles_apply, profiles_create, profiles_delete, profiles_list, profiles_update,
     settings_get, settings_reset_defaults, settings_set,
     shortcuts_reload,
     sessions_clear,
     stats_get_detailed, stats_get_heatmap,
+    tags_create, tags_delete, tags_list,
     themes_list,
-    timer_get_state, timer_reset, timer_restart_round, timer_skip, timer_toggle,
+    timer_adjust_duration, timer_get_state, timer_reset, timer_restart_round, timer_set_tag,
+    timer_skip, timer_toggle,
     window_set_visibility,
 };
 
@@ -110,6 +113,7 @@ pub fn run() {
 
             // Sync tray state from saved settings.
             *tray_state.countdown_mode.lock().unwrap() = initial_settings.dial_countdown;
+            *tray_state.show_timer_title.lock().unwrap() = initial_settings.tray_show_timer;
             let tray_theme_name = match initial_settings.theme_mode.as_str() {
                 "dark" => &initial_settings.theme_dark,
                 _ => &initial_settings.theme_light,
@@ -283,47 +287,94 @@ pub fn run() {
                 let _ = main_window.set_always_on_top(true);
             }
 
-            // Restore saved window position/size if all four values are present and
-            // the saved rectangle still intersects at least one connected monitor.
-            if let (Some(wx), Some(wy), Some(ww), Some(wh)) = (
+            // Restore saved window position/size. Prefer DPI-independent logical
+            // coordinates (v2) so moving between Retina (2×) and external (1×)
+            // displays on macOS keeps the window at the expected physical size;
+            // fall back to legacy physical coordinates (v1) if present.
+            let monitors = app.available_monitors().unwrap_or_default();
+            if let (Some(lx), Some(ly), Some(lw), Some(lh)) = (
+                initial_settings.window_logical_x,
+                initial_settings.window_logical_y,
+                initial_settings.window_logical_width,
+                initial_settings.window_logical_height,
+            ) {
+                let lw = lw.max(240);
+                let lh = lh.max(240);
+                let on_screen = monitors.iter().any(|m| {
+                    let scale = m.scale_factor();
+                    let mp = m.position().to_logical::<f64>(scale);
+                    let ms = m.size().to_logical::<f64>(scale);
+                    let mx0 = mp.x;
+                    let my0 = mp.y;
+                    let mx1 = mx0 + ms.width;
+                    let my1 = my0 + ms.height;
+                    let wx0 = lx as f64;
+                    let wy0 = ly as f64;
+                    let wx1 = wx0 + lw as f64;
+                    let wy1 = wy0 + lh as f64;
+                    wx0 < mx1 && wx1 > mx0 && wy0 < my1 && wy1 > my0
+                });
+                if on_screen {
+                    let _ = main_window.set_size(tauri::LogicalSize::new(lw as f64, lh as f64));
+                    let _ = main_window.set_position(tauri::LogicalPosition::new(lx as f64, ly as f64));
+                }
+            } else if let (Some(wx), Some(wy), Some(ww), Some(wh)) = (
                 initial_settings.window_x,
                 initial_settings.window_y,
                 initial_settings.window_width,
                 initial_settings.window_height,
             ) {
-                let on_screen = app
-                    .available_monitors()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .any(|m| {
-                        let mp = m.position();
-                        let ms = m.size();
-                        let mx0 = mp.x as i64;
-                        let my0 = mp.y as i64;
-                        let mx1 = mx0 + ms.width as i64;
-                        let my1 = my0 + ms.height as i64;
-                        let wx0 = wx as i64;
-                        let wy0 = wy as i64;
-                        let wx1 = wx0 + ww as i64;
-                        let wy1 = wy0 + wh as i64;
-                        wx0 < mx1 && wx1 > mx0 && wy0 < my1 && wy1 > my0
-                    });
+                let on_screen = monitors.iter().any(|m| {
+                    let mp = m.position();
+                    let ms = m.size();
+                    let mx0 = mp.x as i64;
+                    let my0 = mp.y as i64;
+                    let mx1 = mx0 + ms.width as i64;
+                    let my1 = my0 + ms.height as i64;
+                    let wx0 = wx as i64;
+                    let wy0 = wy as i64;
+                    let wx1 = wx0 + ww as i64;
+                    let wy1 = wy0 + wh as i64;
+                    wx0 < mx1 && wx1 > mx0 && wy0 < my1 && wy1 > my0
+                });
                 if on_screen {
                     let _ = main_window.set_position(tauri::PhysicalPosition::new(wx, wy));
                     let _ = main_window.set_size(tauri::PhysicalSize::new(ww, wh));
                 }
             }
 
-            // Persist window position/size on move and resize, and close child windows
-            // when the main window is truly closed (not hidden to tray).
+            // Persist window position/size with a 300ms debounce so dragging or
+            // resizing never stalls the macOS UI thread with per-pixel SQLite
+            // writes, while ignoring events fired while hidden or minimized.
+            let pending_geom: Arc<std::sync::Mutex<Option<(i32, i32, u32, u32)>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let geom_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+            let flush_geom = |db_ref: &db::DbState, geom: (i32, i32, u32, u32)| {
+                if let Ok(conn) = db_ref.lock() {
+                    let (lx, ly, lw, lh) = geom;
+                    let _ = settings::save_setting(&conn, "window_logical_x", &lx.to_string());
+                    let _ = settings::save_setting(&conn, "window_logical_y", &ly.to_string());
+                    let _ = settings::save_setting(&conn, "window_logical_width", &lw.to_string());
+                    let _ = settings::save_setting(&conn, "window_logical_height", &lh.to_string());
+                }
+            };
+
             let db_for_close = db.clone();
             let win_for_close = main_window.clone();
             let app_for_close = app.handle().clone();
             let db_for_pos = db.clone();
             let win_for_pos = main_window.clone();
+            let pending_for_event = Arc::clone(&pending_geom);
+            let gen_for_event = Arc::clone(&geom_gen);
+
             main_window.on_window_event(move |event| {
                 match event {
                     tauri::WindowEvent::CloseRequested { api, .. } => {
+                        // Flush any pending window geometry before closing or hiding.
+                        if let Some(g) = pending_for_event.lock().ok().and_then(|mut p| p.take()) {
+                            flush_geom(&db_for_close, g);
+                        }
                         let hide = db_for_close
                             .lock()
                             .ok()
@@ -342,23 +393,47 @@ pub fn run() {
                             }
                         }
                     }
-                    tauri::WindowEvent::Moved(pos) => {
-                        if let Ok(conn) = db_for_pos.lock() {
-                            let _ = settings::save_setting(&conn, "window_x", &pos.x.to_string());
-                            let _ = settings::save_setting(&conn, "window_y", &pos.y.to_string());
+                    tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
+                        let visible = win_for_pos.is_visible().unwrap_or(false);
+                        let minimized = win_for_pos.is_minimized().unwrap_or(false);
+                        if !visible || minimized {
+                            return;
                         }
-                    }
-                    tauri::WindowEvent::Resized(size) => {
-                        if let Ok(conn) = db_for_pos.lock() {
-                            let _ = settings::save_setting(&conn, "window_width", &size.width.to_string());
-                            let _ = settings::save_setting(&conn, "window_height", &size.height.to_string());
-                            // Also capture position, since some window managers shift the
-                            // window origin when resizing.
-                            if let Ok(pos) = win_for_pos.outer_position() {
-                                let _ = settings::save_setting(&conn, "window_x", &pos.x.to_string());
-                                let _ = settings::save_setting(&conn, "window_y", &pos.y.to_string());
+                        let scale = win_for_pos.scale_factor().unwrap_or(1.0);
+                        let (Ok(pos), Ok(size)) = (win_for_pos.outer_position(), win_for_pos.inner_size()) else {
+                            return;
+                        };
+                        let lpos = pos.to_logical::<f64>(scale);
+                        let lsize = size.to_logical::<f64>(scale);
+                        let lw = lsize.width.round() as u32;
+                        let lh = lsize.height.round() as u32;
+                        if lw < 240 || lh < 240 {
+                            return;
+                        }
+                        let geom = (lpos.x.round() as i32, lpos.y.round() as i32, lw, lh);
+                        if let Ok(mut guard) = pending_for_event.lock() {
+                            *guard = Some(geom);
+                        }
+                        let my_gen = gen_for_event
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                            + 1;
+                        let gen_clone = Arc::clone(&gen_for_event);
+                        let pending_clone = Arc::clone(&pending_for_event);
+                        let db_clone = db_for_pos.clone();
+                        tauri::async_runtime::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                            if gen_clone.load(std::sync::atomic::Ordering::SeqCst) != my_gen {
+                                return;
                             }
-                        }
+                            if let Some(g) = pending_clone.lock().ok().and_then(|mut p| p.take()) {
+                                if let Ok(conn) = db_clone.lock() {
+                                    let _ = settings::save_setting(&conn, "window_logical_x", &g.0.to_string());
+                                    let _ = settings::save_setting(&conn, "window_logical_y", &g.1.to_string());
+                                    let _ = settings::save_setting(&conn, "window_logical_width", &g.2.to_string());
+                                    let _ = settings::save_setting(&conn, "window_logical_height", &g.3.to_string());
+                                }
+                            }
+                        });
                     }
                     _ => {}
                 }
@@ -373,6 +448,17 @@ pub fn run() {
             timer_restart_round,
             timer_skip,
             timer_get_state,
+            timer_adjust_duration,
+            timer_set_tag,
+            // Profiles & Tags
+            profiles_list,
+            profiles_create,
+            profiles_update,
+            profiles_delete,
+            profiles_apply,
+            tags_list,
+            tags_create,
+            tags_delete,
             // Settings
             settings_get,
             settings_set,
